@@ -1,0 +1,14 @@
+.venv/
+__pycache__/
+*.pyc
+barcode_noi_bo.db
+uploads_barcode_file/
+uploads_barcode_image/
+uploads_barcode_pdf/
+uploads_barcode_file/
+uploads_barcode_file/**
+uploads_barcode_image/**
+uploads_barcode_pdf/**
+uploads_barcode_file/*
+uploads_barcode_image/*
+uploads_barcode_pdf/*
