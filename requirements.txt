@@ -2,3 +2,6 @@ flask
 gunicorn
 openpyxl
 werkzeug
+sqlalchemy
+psycopg[binary]
+boto3

@@ -1,22 +1,36 @@
-from flask import Flask, request, redirect, url_for, render_template_string, session, jsonify, flash, send_file
+from flask import (
+    Flask, request, redirect, url_for, render_template_string,
+    session, jsonify, flash, send_file
+)
 from functools import wraps
 from uuid import uuid4
 from datetime import datetime
 from werkzeug.utils import secure_filename
-import sqlite3
+from sqlalchemy import create_engine, text
+from sqlalchemy.exc import SQLAlchemyError
+import boto3
 import os
 import io
 import re
+
 from openpyxl import Workbook, load_workbook
 
 app = Flask(__name__)
-app.secret_key = os.environ.get("APP_SECRET_KEY", "822231")
+app.secret_key = os.environ.get("APP_SECRET_KEY", "doi-secret-key-rat-dai-o-day")
 
-DB_FILE = "barcode_noi_bo.db"
+DATABASE_URL = os.environ.get("DATABASE_URL")
+if not DATABASE_URL:
+    raise RuntimeError("Thiếu DATABASE_URL trong Environment Variables.")
+
+engine = create_engine(
+    DATABASE_URL,
+    pool_pre_ping=True,
+    future=True,
+)
+
 EXPORT_FILE = "du_lieu_ma_vach.xlsx"
-UPLOAD_BARCODE_FOLDER = "uploads_barcode_file"
-
-os.makedirs(UPLOAD_BARCODE_FOLDER, exist_ok=True)
+LOCAL_UPLOAD_FOLDER = "uploads_barcode_file"
+os.makedirs(LOCAL_UPLOAD_FOLDER, exist_ok=True)
 
 ALLOWED_BARCODE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".pdf"}
 
@@ -48,14 +62,6 @@ DEFAULT_ROWS = [
 DEFAULT_SETTINGS = {
     "group_pattern": "3-5-5-1",
 }
-
-
-def get_db():
-    conn = sqlite3.connect(DB_FILE, timeout=30)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA journal_mode=WAL")
-    conn.execute("PRAGMA busy_timeout = 30000")
-    return conn
 
 
 def now_str():
@@ -96,17 +102,46 @@ def allowed_barcode_file(filename: str) -> bool:
 
 def barcode_file_type(filename: str) -> str:
     ext = os.path.splitext(filename.lower())[1]
-    if ext == ".pdf":
-        return "pdf"
-    return "image"
+    return "pdf" if ext == ".pdf" else "image"
+
+
+def db_execute(query: str, params=None, fetch=False, fetchone=False):
+    params = params or {}
+    with engine.begin() as conn:
+        result = conn.execute(text(query), params)
+        if fetchone:
+            row = result.mappings().first()
+            return dict(row) if row else None
+        if fetch:
+            return [dict(r) for r in result.mappings().all()]
+        return None
+
+
+def r2_enabled() -> bool:
+    return all([
+        os.environ.get("R2_ACCOUNT_ID"),
+        os.environ.get("R2_ACCESS_KEY_ID"),
+        os.environ.get("R2_SECRET_ACCESS_KEY"),
+        os.environ.get("R2_BUCKET"),
+    ])
+
+
+def get_s3():
+    return boto3.client(
+        service_name="s3",
+        endpoint_url=f"https://{os.environ['R2_ACCOUNT_ID']}.r2.cloudflarestorage.com",
+        aws_access_key_id=os.environ["R2_ACCESS_KEY_ID"],
+        aws_secret_access_key=os.environ["R2_SECRET_ACCESS_KEY"],
+        region_name="auto",
+    )
+
+
+def storage_mode() -> str:
+    return "r2" if r2_enabled() else "local"
 
 
 def init_db():
-    conn = get_db()
-    cur = conn.cursor()
-
-    cur.execute(
-        """
+    db_execute("""
         CREATE TABLE IF NOT EXISTS admins (
             id TEXT PRIMARY KEY,
             username TEXT UNIQUE,
@@ -115,11 +150,9 @@ def init_db():
             display_name TEXT,
             created_at TEXT
         )
-        """
-    )
+    """)
 
-    cur.execute(
-        """
+    db_execute("""
         CREATE TABLE IF NOT EXISTS barcode_rows (
             id TEXT PRIMARY KEY,
             ten_thung TEXT,
@@ -131,142 +164,116 @@ def init_db():
             created_at TEXT,
             updated_at TEXT
         )
-        """
-    )
+    """)
 
-    cur.execute(
-        """
+    db_execute("""
         CREATE TABLE IF NOT EXISTS app_settings (
             key TEXT PRIMARY KEY,
             value TEXT
         )
-        """
-    )
+    """)
 
-    cur.execute(
-        """
+    db_execute("""
         CREATE TABLE IF NOT EXISTS row_barcode_files (
             id TEXT PRIMARY KEY,
             row_id TEXT UNIQUE,
             original_name TEXT,
-            saved_name TEXT,
+            stored_key TEXT,
             file_type TEXT,
+            storage_mode TEXT,
             uploaded_by TEXT,
             created_at TEXT
         )
-        """
-    )
+    """)
 
-    conn.commit()
-
-    cur.execute("PRAGMA table_info(admins)")
-    admin_cols = [r[1] for r in cur.fetchall()]
-    if "role" not in admin_cols:
-        cur.execute("ALTER TABLE admins ADD COLUMN role TEXT DEFAULT 'admin'")
-    if "display_name" not in admin_cols:
-        cur.execute("ALTER TABLE admins ADD COLUMN display_name TEXT DEFAULT ''")
-
-    cur.execute("PRAGMA table_info(barcode_rows)")
-    row_cols = [r[1] for r in cur.fetchall()]
-    if "updated_by" not in row_cols:
-        cur.execute("ALTER TABLE barcode_rows ADD COLUMN updated_by TEXT DEFAULT 'Super Admin'")
-
-    cur.execute("PRAGMA table_info(row_barcode_files)")
-    barcode_cols = [r[1] for r in cur.fetchall()]
-    if "file_type" not in barcode_cols:
-        cur.execute("ALTER TABLE row_barcode_files ADD COLUMN file_type TEXT DEFAULT 'image'")
-
-    conn.commit()
-
-    cur.execute("SELECT COUNT(*) AS total FROM admins")
-    if cur.fetchone()["total"] == 0:
+    admin_count = db_execute("SELECT COUNT(*) AS total FROM admins", fetchone=True)
+    if admin_count and admin_count["total"] == 0:
         now = now_str()
-        cur.executemany(
-            "INSERT INTO admins (id, username, password, role, display_name, created_at) VALUES (?, ?, ?, ?, ?, ?)",
-            [
-                (str(uuid4()), "superadmin", "123456", "super_admin", "Super Admin", now),
-                (str(uuid4()), "admin1", "123456", "admin", "Admin 1", now),
-                (str(uuid4()), "admin2", "123456", "admin", "Admin 2", now),
-            ],
-        )
-        conn.commit()
+        for row in [
+            (str(uuid4()), "superadmin", "123456", "super_admin", "Super Admin", now),
+            (str(uuid4()), "admin1", "123456", "admin", "Admin 1", now),
+            (str(uuid4()), "admin2", "123456", "admin", "Admin 2", now),
+        ]:
+            db_execute("""
+                INSERT INTO admins (id, username, password, role, display_name, created_at)
+                VALUES (:id, :username, :password, :role, :display_name, :created_at)
+            """, {
+                "id": row[0],
+                "username": row[1],
+                "password": row[2],
+                "role": row[3],
+                "display_name": row[4],
+                "created_at": row[5],
+            })
 
-    cur.execute("UPDATE admins SET role = 'super_admin' WHERE username = 'superadmin' AND (role IS NULL OR role = '')")
-    cur.execute("UPDATE admins SET role = 'admin' WHERE role IS NULL OR role = ''")
-    cur.execute("UPDATE admins SET display_name = username WHERE display_name IS NULL OR display_name = ''")
+    db_execute("""
+        UPDATE admins
+        SET role = 'super_admin'
+        WHERE username = 'superadmin' AND (role IS NULL OR role = '')
+    """)
+    db_execute("""
+        UPDATE admins
+        SET role = 'admin'
+        WHERE role IS NULL OR role = ''
+    """)
+    db_execute("""
+        UPDATE admins
+        SET display_name = username
+        WHERE display_name IS NULL OR display_name = ''
+    """)
 
     for key, value in DEFAULT_SETTINGS.items():
-        cur.execute("INSERT OR IGNORE INTO app_settings (key, value) VALUES (?, ?)", (key, value))
+        db_execute("""
+            INSERT INTO app_settings (key, value)
+            VALUES (:key, :value)
+            ON CONFLICT (key) DO NOTHING
+        """, {"key": key, "value": value})
 
-    cur.execute("SELECT COUNT(*) AS total FROM barcode_rows")
-    if cur.fetchone()["total"] == 0:
+    row_count = db_execute("SELECT COUNT(*) AS total FROM barcode_rows", fetchone=True)
+    if row_count and row_count["total"] == 0:
         for row in DEFAULT_ROWS:
-            cur.execute(
-                """
+            db_execute("""
                 INSERT INTO barcode_rows (
                     id, ten_thung, so_luong_san_pham_thung, ten,
                     ma_vach_sp, so_ma_vach_thung, updated_by, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    row["id"],
-                    row["ten_thung"],
-                    row["so_luong_san_pham_thung"],
-                    row["ten"],
-                    row["ma_vach_sp"],
-                    row["so_ma_vach_thung"],
-                    row["updated_by"],
-                    row["created_at"],
-                    row["updated_at"],
-                ),
-            )
-        conn.commit()
-
-    conn.close()
+                ) VALUES (
+                    :id, :ten_thung, :so_luong_san_pham_thung, :ten,
+                    :ma_vach_sp, :so_ma_vach_thung, :updated_by, :created_at, :updated_at
+                )
+            """, row)
 
 
 def get_settings():
-    conn = get_db()
-    cur = conn.cursor()
-    cur.execute("SELECT key, value FROM app_settings")
-    settings = {r["key"]: r["value"] for r in cur.fetchall()}
-    conn.close()
+    rows = db_execute("SELECT key, value FROM app_settings", fetch=True) or []
+    settings = {r["key"]: r["value"] for r in rows}
     merged = DEFAULT_SETTINGS.copy()
     merged.update(settings)
     return merged
 
 
 def list_barcode_file_map():
-    conn = get_db()
-    cur = conn.cursor()
-    cur.execute("SELECT * FROM row_barcode_files")
-    rows = {r["row_id"]: dict(r) for r in cur.fetchall()}
-    conn.close()
-    return rows
+    rows = db_execute("SELECT * FROM row_barcode_files", fetch=True) or []
+    return {r["row_id"]: r for r in rows}
 
 
 def list_rows(search=""):
-    conn = get_db()
-    cur = conn.cursor()
     if search.strip():
         like = f"%{search.strip()}%"
-        cur.execute(
-            """
+        rows = db_execute("""
             SELECT * FROM barcode_rows
-            WHERE ten_thung LIKE ?
-               OR so_luong_san_pham_thung LIKE ?
-               OR ten LIKE ?
-               OR ma_vach_sp LIKE ?
-               OR so_ma_vach_thung LIKE ?
-               OR updated_by LIKE ?
+            WHERE ten_thung LIKE :like
+               OR so_luong_san_pham_thung LIKE :like
+               OR ten LIKE :like
+               OR ma_vach_sp LIKE :like
+               OR so_ma_vach_thung LIKE :like
+               OR updated_by LIKE :like
             ORDER BY ten_thung ASC, ten ASC
-            """,
-            (like, like, like, like, like, like),
-        )
+        """, {"like": like}, fetch=True) or []
     else:
-        cur.execute("SELECT * FROM barcode_rows ORDER BY ten_thung ASC, ten ASC")
-    rows = [dict(r) for r in cur.fetchall()]
-    conn.close()
+        rows = db_execute("""
+            SELECT * FROM barcode_rows
+            ORDER BY ten_thung ASC, ten ASC
+        """, fetch=True) or []
 
     settings = get_settings()
     barcode_map = list_barcode_file_map()
@@ -281,124 +288,179 @@ def list_rows(search=""):
 
 
 def get_row(row_id):
-    conn = get_db()
-    cur = conn.cursor()
-    cur.execute("SELECT * FROM barcode_rows WHERE id = ?", (row_id,))
-    row = cur.fetchone()
-    conn.close()
-    return dict(row) if row else None
+    return db_execute(
+        "SELECT * FROM barcode_rows WHERE id = :row_id",
+        {"row_id": row_id},
+        fetchone=True,
+    )
 
 
 def create_row(form, updated_by):
     now = now_str()
-    ma_vach_sp = only_digits(form.get("ma_vach_sp", ""))
-    so_ma_vach_thung = only_digits(form.get("so_ma_vach_thung", ""))
-
-    conn = get_db()
-    cur = conn.cursor()
-    cur.execute(
-        """
+    db_execute("""
         INSERT INTO barcode_rows (
             id, ten_thung, so_luong_san_pham_thung, ten,
             ma_vach_sp, so_ma_vach_thung, updated_by, created_at, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """,
-        (
-            str(uuid4()),
-            form.get("ten_thung", "").strip(),
-            form.get("so_luong_san_pham_thung", "").strip(),
-            form.get("ten", "").strip(),
-            ma_vach_sp,
-            so_ma_vach_thung,
-            updated_by,
-            now,
-            now,
-        ),
-    )
-    conn.commit()
-    conn.close()
+        ) VALUES (
+            :id, :ten_thung, :so_luong_san_pham_thung, :ten,
+            :ma_vach_sp, :so_ma_vach_thung, :updated_by, :created_at, :updated_at
+        )
+    """, {
+        "id": str(uuid4()),
+        "ten_thung": form.get("ten_thung", "").strip(),
+        "so_luong_san_pham_thung": form.get("so_luong_san_pham_thung", "").strip(),
+        "ten": form.get("ten", "").strip(),
+        "ma_vach_sp": only_digits(form.get("ma_vach_sp", "")),
+        "so_ma_vach_thung": only_digits(form.get("so_ma_vach_thung", "")),
+        "updated_by": updated_by,
+        "created_at": now,
+        "updated_at": now,
+    })
 
 
 def update_row_db(row_id, form, updated_by):
-    now = now_str()
-    ma_vach_sp = only_digits(form.get("ma_vach_sp", ""))
-    so_ma_vach_thung = only_digits(form.get("so_ma_vach_thung", ""))
-
-    conn = get_db()
-    cur = conn.cursor()
-    cur.execute(
-        """
+    db_execute("""
         UPDATE barcode_rows
-        SET ten_thung = ?, so_luong_san_pham_thung = ?, ten = ?, ma_vach_sp = ?,
-            so_ma_vach_thung = ?, updated_by = ?, updated_at = ?
-        WHERE id = ?
-        """,
-        (
-            form.get("ten_thung", "").strip(),
-            form.get("so_luong_san_pham_thung", "").strip(),
-            form.get("ten", "").strip(),
-            ma_vach_sp,
-            so_ma_vach_thung,
-            updated_by,
-            now,
-            row_id,
-        ),
+        SET ten_thung = :ten_thung,
+            so_luong_san_pham_thung = :so_luong_san_pham_thung,
+            ten = :ten,
+            ma_vach_sp = :ma_vach_sp,
+            so_ma_vach_thung = :so_ma_vach_thung,
+            updated_by = :updated_by,
+            updated_at = :updated_at
+        WHERE id = :row_id
+    """, {
+        "ten_thung": form.get("ten_thung", "").strip(),
+        "so_luong_san_pham_thung": form.get("so_luong_san_pham_thung", "").strip(),
+        "ten": form.get("ten", "").strip(),
+        "ma_vach_sp": only_digits(form.get("ma_vach_sp", "")),
+        "so_ma_vach_thung": only_digits(form.get("so_ma_vach_thung", "")),
+        "updated_by": updated_by,
+        "updated_at": now_str(),
+        "row_id": row_id,
+    })
+
+
+def get_row_barcode_file(row_id):
+    return db_execute(
+        "SELECT * FROM row_barcode_files WHERE row_id = :row_id",
+        {"row_id": row_id},
+        fetchone=True,
     )
-    conn.commit()
-    conn.close()
+
+
+def delete_storage_object(stored_key: str, mode: str):
+    if not stored_key:
+        return
+    if mode == "r2" and r2_enabled():
+        try:
+            s3 = get_s3()
+            s3.delete_object(Bucket=os.environ["R2_BUCKET"], Key=stored_key)
+        except Exception:
+            pass
+    else:
+        local_path = os.path.join(LOCAL_UPLOAD_FOLDER, stored_key)
+        if os.path.exists(local_path):
+            try:
+                os.remove(local_path)
+            except OSError:
+                pass
+
+
+def save_row_barcode_file(row_id, file_storage, uploaded_by):
+    old = get_row_barcode_file(row_id)
+    if old:
+        delete_storage_object(old["stored_key"], old.get("storage_mode", "local"))
+
+    original_name = file_storage.filename or "barcode_file"
+    safe_original = secure_filename(original_name)
+    file_id = str(uuid4())
+    ext = os.path.splitext(safe_original)[1].lower()
+    file_type = barcode_file_type(original_name)
+    mode = storage_mode()
+
+    if mode == "r2":
+        stored_key = f"barcode/{row_id}/{file_id}{ext}"
+        s3 = get_s3()
+        file_storage.stream.seek(0)
+        s3.upload_fileobj(
+            file_storage.stream,
+            os.environ["R2_BUCKET"],
+            stored_key,
+            ExtraArgs={"ContentType": file_storage.mimetype or "application/octet-stream"},
+        )
+    else:
+        stored_key = f"{file_id}_{safe_original}"
+        file_storage.save(os.path.join(LOCAL_UPLOAD_FOLDER, stored_key))
+
+    db_execute("""
+        INSERT INTO row_barcode_files (
+            id, row_id, original_name, stored_key, file_type, storage_mode, uploaded_by, created_at
+        ) VALUES (
+            :id, :row_id, :original_name, :stored_key, :file_type, :storage_mode, :uploaded_by, :created_at
+        )
+        ON CONFLICT (row_id) DO UPDATE SET
+            original_name = EXCLUDED.original_name,
+            stored_key = EXCLUDED.stored_key,
+            file_type = EXCLUDED.file_type,
+            storage_mode = EXCLUDED.storage_mode,
+            uploaded_by = EXCLUDED.uploaded_by,
+            created_at = EXCLUDED.created_at
+    """, {
+        "id": file_id,
+        "row_id": row_id,
+        "original_name": original_name,
+        "stored_key": stored_key,
+        "file_type": file_type,
+        "storage_mode": mode,
+        "uploaded_by": uploaded_by,
+        "created_at": now_str(),
+    })
+
+
+def delete_row_barcode_file(row_id):
+    row = get_row_barcode_file(row_id)
+    if not row:
+        return
+    delete_storage_object(row["stored_key"], row.get("storage_mode", "local"))
+    db_execute("DELETE FROM row_barcode_files WHERE row_id = :row_id", {"row_id": row_id})
 
 
 def delete_row_db(row_id):
     delete_row_barcode_file(row_id)
-    conn = get_db()
-    conn.execute("DELETE FROM barcode_rows WHERE id = ?", (row_id,))
-    conn.commit()
-    conn.close()
+    db_execute("DELETE FROM barcode_rows WHERE id = :row_id", {"row_id": row_id})
 
 
 def replace_all_rows(rows, updated_by):
-    conn = get_db()
-    try:
-        cur = conn.cursor()
-        cur.execute("BEGIN IMMEDIATE")
-        cur.execute("DELETE FROM barcode_rows")
-        cur.execute("DELETE FROM row_barcode_files")
-        conn.commit()
+    # Xóa file barcode cũ
+    old_files = db_execute("SELECT * FROM row_barcode_files", fetch=True) or []
+    for f in old_files:
+        delete_storage_object(f["stored_key"], f.get("storage_mode", "local"))
 
-        for filename in os.listdir(UPLOAD_BARCODE_FOLDER):
-            try:
-                os.remove(os.path.join(UPLOAD_BARCODE_FOLDER, filename))
-            except OSError:
-                pass
+    db_execute("DELETE FROM row_barcode_files")
+    db_execute("DELETE FROM barcode_rows")
 
-        cur.execute("BEGIN IMMEDIATE")
-        for row in rows:
-            now = now_str()
-            ma_vach_sp = only_digits(row.get("ma_vach_sp", ""))
-            so_ma_vach_thung = only_digits(row.get("so_ma_vach_thung", ""))
-
-            cur.execute(
-                """
-                INSERT INTO barcode_rows (
-                    id, ten_thung, so_luong_san_pham_thung, ten,
-                    ma_vach_sp, so_ma_vach_thung, updated_by, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    str(uuid4()),
-                    row.get("ten_thung", "").strip(),
-                    row.get("so_luong_san_pham_thung", "").strip(),
-                    row.get("ten", "").strip(),
-                    ma_vach_sp,
-                    so_ma_vach_thung,
-                    updated_by,
-                    now,
-                    now,
-                ),
+    for row in rows:
+        now = now_str()
+        db_execute("""
+            INSERT INTO barcode_rows (
+                id, ten_thung, so_luong_san_pham_thung, ten,
+                ma_vach_sp, so_ma_vach_thung, updated_by, created_at, updated_at
+            ) VALUES (
+                :id, :ten_thung, :so_luong_san_pham_thung, :ten,
+                :ma_vach_sp, :so_ma_vach_thung, :updated_by, :created_at, :updated_at
             )
-        conn.commit()
-    finally:
-        conn.close()
+        """, {
+            "id": str(uuid4()),
+            "ten_thung": row.get("ten_thung", "").strip(),
+            "so_luong_san_pham_thung": row.get("so_luong_san_pham_thung", "").strip(),
+            "ten": row.get("ten", "").strip(),
+            "ma_vach_sp": only_digits(row.get("ma_vach_sp", "")),
+            "so_ma_vach_thung": only_digits(row.get("so_ma_vach_thung", "")),
+            "updated_by": updated_by,
+            "created_at": now,
+            "updated_at": now,
+        })
 
 
 def group_rows(rows):
@@ -420,123 +482,68 @@ def group_rows(rows):
 
 
 def list_admins():
-    conn = get_db()
-    cur = conn.cursor()
-    cur.execute(
-        "SELECT id, username, password, role, display_name, created_at FROM admins "
-        "ORDER BY CASE WHEN role='super_admin' THEN 0 ELSE 1 END, username ASC"
-    )
-    rows = [dict(r) for r in cur.fetchall()]
-    conn.close()
-    return rows
+    return db_execute("""
+        SELECT id, username, password, role, display_name, created_at
+        FROM admins
+        ORDER BY CASE WHEN role='super_admin' THEN 0 ELSE 1 END, username ASC
+    """, fetch=True) or []
 
 
 def admin_exists(username):
-    conn = get_db()
-    cur = conn.cursor()
-    cur.execute("SELECT id FROM admins WHERE lower(username) = lower(?)", (username.strip(),))
-    row = cur.fetchone()
-    conn.close()
+    row = db_execute(
+        "SELECT id FROM admins WHERE lower(username) = lower(:username)",
+        {"username": username.strip()},
+        fetchone=True,
+    )
     return row is not None
 
 
 def verify_admin(username, password):
-    conn = get_db()
-    cur = conn.cursor()
-    cur.execute(
-        "SELECT id, username, role, display_name FROM admins WHERE username = ? AND password = ?",
-        (username.strip(), password),
-    )
-    row = cur.fetchone()
-    conn.close()
-    return dict(row) if row else None
+    return db_execute("""
+        SELECT id, username, role, display_name
+        FROM admins
+        WHERE username = :username AND password = :password
+    """, {
+        "username": username.strip(),
+        "password": password,
+    }, fetchone=True)
 
 
 def get_admin_by_id(admin_id):
-    conn = get_db()
-    cur = conn.cursor()
-    cur.execute("SELECT id, username, role, display_name, created_at FROM admins WHERE id = ?", (admin_id,))
-    row = cur.fetchone()
-    conn.close()
-    return dict(row) if row else None
+    return db_execute("""
+        SELECT id, username, role, display_name, created_at
+        FROM admins
+        WHERE id = :admin_id
+    """, {"admin_id": admin_id}, fetchone=True)
 
 
 def create_admin_user(username, password, role, display_name):
-    conn = get_db()
-    conn.execute(
-        "INSERT INTO admins (id, username, password, role, display_name, created_at) VALUES (?, ?, ?, ?, ?, ?)",
-        (str(uuid4()), username.strip(), password, role, display_name.strip(), now_str()),
-    )
-    conn.commit()
-    conn.close()
+    db_execute("""
+        INSERT INTO admins (id, username, password, role, display_name, created_at)
+        VALUES (:id, :username, :password, :role, :display_name, :created_at)
+    """, {
+        "id": str(uuid4()),
+        "username": username.strip(),
+        "password": password,
+        "role": role,
+        "display_name": display_name.strip(),
+        "created_at": now_str(),
+    })
 
 
 def delete_admin_user(admin_id):
-    conn = get_db()
-    conn.execute("DELETE FROM admins WHERE id = ?", (admin_id,))
-    conn.commit()
-    conn.close()
+    db_execute("DELETE FROM admins WHERE id = :admin_id", {"admin_id": admin_id})
 
 
 def update_admin_password(admin_id, new_password):
-    conn = get_db()
-    conn.execute("UPDATE admins SET password = ? WHERE id = ?", (new_password, admin_id))
-    conn.commit()
-    conn.close()
-
-
-def get_row_barcode_file(row_id):
-    conn = get_db()
-    cur = conn.cursor()
-    cur.execute("SELECT * FROM row_barcode_files WHERE row_id = ?", (row_id,))
-    row = cur.fetchone()
-    conn.close()
-    return dict(row) if row else None
-
-
-def save_row_barcode_file(row_id, file_storage, uploaded_by):
-    old = get_row_barcode_file(row_id)
-    if old:
-        old_path = os.path.join(UPLOAD_BARCODE_FOLDER, old["saved_name"])
-        if os.path.exists(old_path):
-            os.remove(old_path)
-
-    original_name = file_storage.filename or "barcode_file"
-    safe_original = secure_filename(original_name)
-    file_id = str(uuid4())
-    saved_name = f"{file_id}_{safe_original}"
-    save_path = os.path.join(UPLOAD_BARCODE_FOLDER, saved_name)
-    file_storage.save(save_path)
-
-    file_type = barcode_file_type(original_name)
-
-    conn = get_db()
-    cur = conn.cursor()
-    cur.execute(
-        """
-        INSERT OR REPLACE INTO row_barcode_files (id, row_id, original_name, saved_name, file_type, uploaded_by, created_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?)
-        """,
-        (file_id, row_id, original_name, saved_name, file_type, uploaded_by, now_str()),
-    )
-    conn.commit()
-    conn.close()
-
-
-def delete_row_barcode_file(row_id):
-    row = get_row_barcode_file(row_id)
-    if not row:
-        return
-
-    file_path = os.path.join(UPLOAD_BARCODE_FOLDER, row["saved_name"])
-    if os.path.exists(file_path):
-        os.remove(file_path)
-
-    conn = get_db()
-    cur = conn.cursor()
-    cur.execute("DELETE FROM row_barcode_files WHERE row_id = ?", (row_id,))
-    conn.commit()
-    conn.close()
+    db_execute("""
+        UPDATE admins
+        SET password = :password
+        WHERE id = :admin_id
+    """, {
+        "password": new_password,
+        "admin_id": admin_id,
+    })
 
 
 def admin_required(fn):
@@ -607,7 +614,6 @@ PAGE_HTML = """
     .meta{color:var(--muted);font-size:13px}
     .stats-pill{display:inline-flex;align-items:center;gap:8px;padding:8px 12px;border-radius:999px;background:#f8fafc;border:1px solid var(--line);font-size:13px;font-weight:700;color:#334155}
     .section-title{font-size:18px;font-weight:900;color:#0f172a;margin:0}
-    .form-note{margin-top:8px;color:var(--muted);font-size:13px}
     @media print{.topbar,.toolbar form,.btn,.scan-grid,.actions,.barcode-action-box form{display:none !important}body{background:#fff}.card{box-shadow:none;border:1px solid #d1d5db}}
     @media (max-width:1100px){.grid,.scan-grid{grid-template-columns:1fr}td.group-cell,td.qty-cell{font-size:16px}.hit-title{font-size:24px}.hit-row{font-size:18px}.hit-code{font-size:24px}}
   </style>
@@ -615,7 +621,7 @@ PAGE_HTML = """
 <body>
   <div class="container">
     <div class="topbar">
-      <div><h1>Bảng mã vạch nội bộ</h1><div class="sub">Mỗi sản phẩm có thể upload barcode dạng ảnh hoặc PDF.</div></div>
+      <div><h1>Bảng mã vạch nội bộ</h1><div class="sub">PostgreSQL + upload barcode bền hơn, hỗ trợ ảnh hoặc PDF.</div></div>
       <div style="display:flex; gap:8px; align-items:center; flex-wrap:wrap;">
         {% if is_admin %}
           <span class="badge">{{ admin_display_name }}{% if is_super_admin %} - Super Admin{% else %} - Admin{% endif %}</span>
@@ -667,7 +673,10 @@ PAGE_HTML = """
             <div class="toolbar2">
               <button class="btn" type="button" onclick="startScanner()">Bật camera scan</button>
               <button class="btn secondary" type="button" onclick="stopScanner()">Tắt camera</button>
+              <button class="btn secondary" type="button" onclick="switchCamera()">Đổi camera</button>
+              <button class="btn secondary" type="button" onclick="toggleTorch()">Đèn flash</button>
             </div>
+            <div class="meta" id="cameraStatus" style="margin-top:8px;">Chưa bật camera</div>
           </div>
           <div>
             <div class="scan-result">
@@ -861,6 +870,12 @@ PAGE_HTML = """
     const SETTINGS = {{ settings_json | safe }};
     let scannerInstance = null;
     let scanning = false;
+    let currentCameraIndex = 0;
+    let cameraList = [];
+    let lastScannedText = '';
+    let lastScanAt = 0;
+    let torchEnabled = false;
+    let beepCtx = null;
 
     function digitsOnly(v){
       return String(v || '').replace(/\\D/g, '');
@@ -916,42 +931,134 @@ PAGE_HTML = """
         </div>`).join('');
     }
 
+    function setCameraStatus(text) {
+      const el = document.getElementById('cameraStatus');
+      if (el) el.innerText = text;
+    }
+
+    function beepOk() {
+      try {
+        if (!beepCtx) beepCtx = new (window.AudioContext || window.webkitAudioContext)();
+        const osc = beepCtx.createOscillator();
+        const gain = beepCtx.createGain();
+        osc.type = 'sine';
+        osc.frequency.value = 880;
+        gain.gain.value = 0.05;
+        osc.connect(gain);
+        gain.connect(beepCtx.destination);
+        osc.start();
+        setTimeout(() => osc.stop(), 120);
+      } catch (e) {}
+    }
+
     function onScanSuccess(decodedText) {
+      const now = Date.now();
+      if (decodedText === lastScannedText && now - lastScanAt < 1500) return;
+      lastScannedText = decodedText;
+      lastScanAt = now;
       renderHits(decodedText);
       const searchInput = document.querySelector('input[name="q"]');
       if (searchInput) searchInput.value = decodedText;
+      beepOk();
+      setCameraStatus('Đã quét: ' + decodedText);
     }
 
-    function startScanner() {
+    async function startScanner() {
       if (scanning) return;
-      scannerInstance = new Html5Qrcode('reader');
-      Html5Qrcode.getCameras().then(devices => {
-        if (!devices || !devices.length) {
+      try {
+        cameraList = await Html5Qrcode.getCameras();
+        if (!cameraList || !cameraList.length) {
           alert('Không tìm thấy camera trên thiết bị này.');
+          setCameraStatus('Không tìm thấy camera');
           return;
         }
-        const cameraId = devices[0].id;
-        scannerInstance.start(
+        if (currentCameraIndex >= cameraList.length) currentCameraIndex = 0;
+        const cameraId = cameraList[currentCameraIndex].id;
+        scannerInstance = new Html5Qrcode('reader');
+        await scannerInstance.start(
           cameraId,
-          { fps: 10, qrbox: { width: 250, height: 120 } },
+          {
+            fps: 12,
+            qrbox: function(viewfinderWidth, viewfinderHeight) {
+              const w = Math.floor(Math.min(viewfinderWidth * 0.88, 420));
+              const h = Math.floor(Math.min(viewfinderHeight * 0.34, 180));
+              return { width: w, height: h };
+            },
+            aspectRatio: 1.777,
+            disableFlip: false,
+            experimentalFeatures: { useBarCodeDetectorIfSupported: true },
+            formatsToSupport: [
+              Html5QrcodeSupportedFormats.CODE_128,
+              Html5QrcodeSupportedFormats.CODE_39,
+              Html5QrcodeSupportedFormats.EAN_13,
+              Html5QrcodeSupportedFormats.EAN_8,
+              Html5QrcodeSupportedFormats.UPC_A,
+              Html5QrcodeSupportedFormats.UPC_E,
+              Html5QrcodeSupportedFormats.QR_CODE
+            ]
+          },
           onScanSuccess,
           () => {}
-        ).then(() => {
-          scanning = true;
-        }).catch(() => {
-          alert('Không bật được camera. Hãy kiểm tra quyền truy cập camera.');
-        });
-      }).catch(() => {
-        alert('Thiết bị không hỗ trợ lấy danh sách camera.');
-      });
+        );
+        scanning = true;
+        torchEnabled = false;
+        const camName = cameraList[currentCameraIndex].label || `Camera ${currentCameraIndex + 1}`;
+        setCameraStatus('Đang dùng: ' + camName);
+      } catch (e) {
+        alert('Không bật được camera. Hãy kiểm tra quyền camera hoặc thử Chrome/Edge trên điện thoại.');
+        setCameraStatus('Bật camera thất bại');
+      }
     }
 
-    function stopScanner() {
-      if (!scannerInstance || !scanning) return;
-      scannerInstance.stop().then(() => {
-        scannerInstance.clear();
-        scanning = false;
-      }).catch(() => {});
+    async function stopScanner() {
+      try {
+        if (!scannerInstance || !scanning) return;
+        await scannerInstance.stop();
+        await scannerInstance.clear();
+      } catch (e) {}
+      scannerInstance = null;
+      scanning = false;
+      torchEnabled = false;
+      setCameraStatus('Đã tắt camera');
+    }
+
+    async function switchCamera() {
+      try {
+        if (!cameraList || !cameraList.length) cameraList = await Html5Qrcode.getCameras();
+        if (!cameraList.length) {
+          alert('Không có camera để đổi.');
+          return;
+        }
+        currentCameraIndex = (currentCameraIndex + 1) % cameraList.length;
+        if (scanning) {
+          await stopScanner();
+          await startScanner();
+        } else {
+          const camName = cameraList[currentCameraIndex].label || `Camera ${currentCameraIndex + 1}`;
+          setCameraStatus('Đã chọn: ' + camName);
+        }
+      } catch (e) {
+        alert('Không đổi được camera.');
+      }
+    }
+
+    async function toggleTorch() {
+      if (!scannerInstance || !scanning) {
+        alert('Hãy bật camera trước.');
+        return;
+      }
+      try {
+        const capabilities = scannerInstance.getRunningTrackCapabilities ? scannerInstance.getRunningTrackCapabilities() : null;
+        if (!capabilities || !capabilities.torch) {
+          alert('Camera này không hỗ trợ đèn flash.');
+          return;
+        }
+        torchEnabled = !torchEnabled;
+        await scannerInstance.applyVideoConstraints({ advanced: [{ torch: torchEnabled }] });
+        setCameraStatus(torchEnabled ? 'Đã bật đèn flash' : 'Đã tắt đèn flash');
+      } catch (e) {
+        alert('Không bật được đèn flash trên thiết bị này.');
+      }
     }
 
     {% if q %}renderHits({{ q | tojson }});{% endif %}
@@ -1151,8 +1258,14 @@ def upload_row_barcode(row_id):
         flash("Chỉ cho phép file PNG/JPG/JPEG/WEBP/PDF.", "error")
         return redirect(url_for("index"))
 
-    save_row_barcode_file(row_id, file, session.get("admin_display_name", session.get("admin_username", "")))
-    flash("Đã tải lên barcode cho sản phẩm.", "success")
+    try:
+        save_row_barcode_file(row_id, file, session.get("admin_display_name", session.get("admin_username", "")))
+        if storage_mode() == "r2":
+            flash("Đã tải lên barcode lên cloud.", "success")
+        else:
+            flash("Đã tải lên barcode local. Chưa cấu hình cloud nên file có thể không bền sau redeploy.", "success")
+    except Exception as e:
+        flash(f"Lỗi upload barcode: {e}", "error")
     return redirect(url_for("index"))
 
 
@@ -1163,7 +1276,20 @@ def download_row_barcode(row_id):
         flash("Sản phẩm này chưa có barcode.", "error")
         return redirect(url_for("index"))
 
-    file_path = os.path.join(UPLOAD_BARCODE_FOLDER, row["saved_name"])
+    if row.get("storage_mode") == "r2" and r2_enabled():
+        try:
+            s3 = get_s3()
+            url = s3.generate_presigned_url(
+                "get_object",
+                Params={"Bucket": os.environ["R2_BUCKET"], "Key": row["stored_key"]},
+                ExpiresIn=3600,
+            )
+            return redirect(url)
+        except Exception:
+            flash("Không tạo được link tải file cloud.", "error")
+            return redirect(url_for("index"))
+
+    file_path = os.path.join(LOCAL_UPLOAD_FOLDER, row["stored_key"])
     if not os.path.exists(file_path):
         flash("File barcode không còn tồn tại.", "error")
         return redirect(url_for("index"))
